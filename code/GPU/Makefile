@@ -127,8 +127,8 @@ setup_particles.o: gn.h boundary.h primitives.h distribute.h node.h  \
 	cloud2d.cpp disk3d.cpp \
 	cloud3d.cpp \
 	eccentric3d.cpp \
-	brio_wu.cpp \
-	pair_instability.cpp
+	brio_wu.cpp 
+#	pair_instability.cpp
 compute_weights.o: gn.h boundary.h primitives.h distribute.h node.h  myMPI.h pfloat.h nfloat.h
 renorm.o: gn.h boundary.h primitives.h distribute.h node.h  myMPI.h pfloat.h nfloat.h 
 gradient.o: gn.h boundary.h primitives.h distribute.h node.h  myMPI.h pfloat.h nfloat.h
