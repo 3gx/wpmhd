@@ -8,11 +8,11 @@
 #endif
 
 
+#include <mpi.h>
 #include <iostream>
 #include <vector>
 #include <cmath>
 #include <cassert>
-#include <mpi.h>
 #include "pfloat.h"
 
 #ifndef HUGE
