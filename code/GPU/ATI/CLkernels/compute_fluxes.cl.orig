@@ -1,0 +1,475 @@
+#ifndef _COMPUTE_FLUXES_CL_
+#define _COMPUTE_FLUXES_CL_
+
+// #pragma OPENCL EXTENSION cl_khr_fp64 : enable
+
+#define REAL float
+#define SQRT sqrt
+
+__inline float compute_pressure(const float dens, const float ethm, const float gamma_gas) {
+  return (gamma_gas > 1.0f) ? ethm*(gamma_gas - 1.0f) : ethm;
+}
+
+struct ptcl_mhd_cl {
+  float dens, etot, momx, momy, momz, by, bz;
+};
+
+__inline REAL sqr(const REAL x) {return x*x;}
+
+__inline float2 monotonicity(const float fLin, const float fRin, const float fi, const float fj) {
+  float fL = fLin;
+  float fR = fRin;
+  const float Fmin = fmin(fi, fj);
+  const float Fmax = fmax(fi, fj);
+  if ((fL < Fmin) || (fL > Fmax) || (fR < Fmin) || (fR > Fmax)) {
+    fL = fR = fi;
+    fL = fi;
+    fR = fj;
+  }
+  return (float2){fL, fR};
+}
+
+__inline struct ptcl_mhd_cl riemann_solver(const float w, 
+					   const float b,
+					   const float gamma_gas,
+					   const float dens_L, 
+					   const float pres_L, 
+					   const float velx_L,
+					   const float vely_L,
+					   const float velz_L,
+					   const float By_L,
+					   const float Bz_L,
+					   const float dens_R, 
+					   const float pres_R, 
+					   const float velx_R,
+					   const float vely_R,
+					   const float velz_R,
+					   const float By_R,
+					   const float Bz_R) {
+#if 1
+  const float Bx     = b;
+  const float signBx = (fabs(Bx) > 0.0f) ? Bx/fabs(Bx) : 0.0f;
+  
+  const REAL momx_L = dens_L*velx_L;
+  const REAL momy_L = dens_L*vely_L;
+  const REAL momz_L = dens_L*velz_L;
+  
+  const REAL momx_R = dens_R*velx_R;
+  const REAL momy_R = dens_R*vely_R;
+  const REAL momz_R = dens_R*velz_R;
+  
+  const REAL B2_L   = sqr(Bx)     + sqr(By_L)   + sqr(Bz_L);
+  const REAL v2_L   = sqr(velx_L) + sqr(vely_L) + sqr(velz_L);
+  const REAL etot_L = (gamma_gas == 1.0f) ? 
+    pres_L                    + 0.5f*dens_L*v2_L + 0.5f*B2_L :
+    pres_L/(gamma_gas - 1.0f) + 0.5f*dens_L*v2_L + 0.5f*B2_L;
+
+  const REAL B2_R   = sqr(Bx)     + sqr(By_R)   + sqr(Bz_R);
+  const REAL v2_R   = sqr(velx_R) + sqr(vely_R) + sqr(velz_R);
+  const REAL etot_R = (gamma_gas == 1.0f) ? 
+    pres_R                    + 0.5f*dens_R*v2_R + 0.5f*B2_R : 
+    pres_R/(gamma_gas - 1.0f) + 0.5f*dens_R*v2_R + 0.5f*B2_R;
+  
+  const REAL gpl  = gamma_gas * pres_L;
+  const REAL gpr  = gamma_gas * pres_R;
+  const REAL gpbl = gpl + B2_L;
+  const REAL gpbr = gpr + B2_R;
+
+  //////////
+
+  const REAL cfl = SQRT((gpbl + SQRT( sqr(gpbl) - 4.0f*gpl*sqr(Bx) ))/(2.0f*dens_L));
+  const REAL cfr = SQRT((gpbr + SQRT( sqr(gpbr) - 4.0f*gpr*sqr(Bx) ))/(2.0f*dens_R));
+  const REAL cfmax = fmax(cfl,cfr);
+
+  const REAL S_L = fmin(velx_L, velx_R) - cfmax;
+  const REAL S_R = fmax(velx_L, velx_R) + cfmax;
+
+  //////////
+
+  
+  const REAL pT_L = pres_L + 0.5f * B2_L;
+  const REAL pT_R = pres_R + 0.5f * B2_R;
+  
+  const REAL iSM = 1.0f/((S_R - velx_R)*dens_R - (S_L - velx_L)*dens_L);
+  const REAL S_M  = ((S_R - velx_R)*momx_R - (S_L - velx_L)*momx_L - pT_R + pT_L)*iSM;
+  
+  const REAL ipTs = 1.0f/((S_R - velx_R)*dens_R - (S_L - velx_L)*dens_L);
+  const REAL pT_s = ipTs * ((S_R - velx_R)*dens_R*pT_L - (S_L - velx_L)*dens_L*pT_R +
+			    dens_L*dens_R*(S_R - velx_R)*(S_L - velx_L)*(velx_R - velx_L));
+  
+  const REAL velx_L_s  = S_M;
+  const REAL velx_L_ss = S_M;
+  const REAL velx_R_s  = S_M;
+  const REAL velx_R_ss = S_M;
+  const REAL B2x       = Bx*Bx;
+  
+  const REAL dens_L_s = dens_L * (S_L - velx_L)/(S_L - S_M);
+  const REAL divL     = dens_L*(S_L - velx_L)*(S_L - S_M) - B2x;
+  const REAL idivL    = (divL != 0.0f) ? 1.0f/divL : 0.0f;
+  const REAL vely_L_s = vely_L - Bx*By_L*(S_M - velx_L) * idivL;
+  const REAL velz_L_s = velz_L - Bx*Bz_L*(S_M - velx_L) * idivL;
+  const REAL   By_L_s = By_L * (dens_L*sqr(S_L - velx_L) - B2x) * idivL;
+  const REAL   Bz_L_s = Bz_L * (dens_L*sqr(S_L - velx_L) - B2x) * idivL;
+
+  const REAL dens_R_s = dens_R * (S_R - velx_R)/(S_R - S_M);
+  const REAL divR     = dens_R*(S_R - velx_R)*(S_R - S_M) - B2x;
+  const REAL idivR    = (divR != 0.0f) ? 1.0f/divR : 0.0f;
+  const REAL vely_R_s = vely_R - Bx*By_R*(S_M - velx_R) * idivR;
+  const REAL velz_R_s = velz_R - Bx*Bz_R*(S_M - velx_R) * idivR;
+  const REAL   By_R_s = By_R * (dens_R*sqr(S_R - velx_R) - B2x) * idivR;
+  const REAL   Bz_R_s = Bz_R * (dens_R*sqr(S_R - velx_R) - B2x) * idivR;
+
+  const REAL   vB_L   = velx_L  *Bx + vely_L  *By_L   + velz_L  *Bz_L;
+  const REAL   vB_L_s = velx_L_s*Bx + vely_L_s*By_L_s + velz_L_s*Bz_L_s;
+  const REAL etot_L_s = ((S_L - velx_L)*etot_L - pT_L*velx_L + pT_s*S_M + Bx*(vB_L - vB_L_s))/(S_L - S_M);
+
+  const REAL   vB_R   = velx_R  *Bx + vely_R  *By_R   + velz_R  *Bz_R;
+  const REAL   vB_R_s = velx_R_s*Bx + vely_R_s*By_R_s + velz_R_s*Bz_R_s;
+  const REAL etot_R_s = ((S_R - velx_R)*etot_R - pT_R*velx_R + pT_s*S_M + Bx*(vB_R - vB_R_s))/(S_R - S_M);
+
+  const REAL dens_L_ss = dens_L_s;
+  const REAL dens_R_ss = dens_R_s;
+  const REAL    S_L_s  = S_M - fabs(Bx)/SQRT(dens_L_s);
+  const REAL    S_R_s  = S_M + fabs(Bx)/SQRT(dens_R_s);
+
+  const REAL idSQRT  = 1.0f/(SQRT(dens_L_s) + SQRT(dens_R_s));
+  const REAL  vely_ss = idSQRT*(SQRT(dens_L_s)*vely_L_s + SQRT(dens_R_s)*vely_R_s + (By_R_s - By_L_s)*signBx);
+  const REAL  velz_ss = idSQRT*(SQRT(dens_L_s)*velz_L_s + SQRT(dens_R_s)*velz_R_s + (Bz_R_s - Bz_L_s)*signBx);
+
+  const REAL By_ss = idSQRT*(SQRT(dens_L_s)*By_R_s + SQRT(dens_R_s)*By_L_s + SQRT(dens_L_s*dens_R_s)*(vely_R_s - vely_L_s)*signBx);
+  const REAL Bz_ss = idSQRT*(SQRT(dens_L_s)*Bz_R_s + SQRT(dens_R_s)*Bz_L_s + SQRT(dens_L_s*dens_R_s)*(velz_R_s - velz_L_s)*signBx);
+  
+  const REAL vely_L_ss = vely_ss;
+  const REAL velz_L_ss = velz_ss;
+  const REAL   By_L_ss = By_ss;
+  const REAL   Bz_L_ss = Bz_ss;
+
+  const REAL vely_R_ss = vely_ss;
+  const REAL velz_R_ss = velz_ss;
+  const REAL   By_R_ss = By_ss;
+  const REAL   Bz_R_ss = Bz_ss;
+
+  const REAL vB_L_ss   = velx_L_ss*Bx + vely_L_ss*By_L_ss + velz_L_ss*Bz_L_ss;
+  const REAL etot_L_ss = etot_L_s - SQRT(dens_L_s)*(vB_L_s - vB_L_ss)*signBx;
+
+  const REAL vB_R_ss   = velx_R_ss*Bx + vely_R_ss*By_R_ss + velz_R_ss*Bz_R_ss;
+  const REAL etot_R_ss = etot_R_s + SQRT(dens_R_s)*(vB_R_s - vB_R_ss)*signBx;
+
+  const REAL Fdens_L = dens_L*velx_L;
+  const REAL Fmomx_L = momx_L*velx_L + pT_L - B2x;
+  const REAL Fmomy_L = momy_L*velx_L        - Bx*By_L;
+  const REAL Fmomz_L = momz_L*velx_L        - Bx*Bz_L;
+  const REAL Fetot_L = etot_L*velx_L + pT_L*velx_L - Bx*vB_L; 
+
+  const REAL Fdens_R = dens_R*velx_R;
+  const REAL Fmomx_R = momx_R*velx_R + pT_R - B2x;
+  const REAL Fmomy_R = momy_R*velx_R        - Bx*By_R;
+  const REAL Fmomz_R = momz_R*velx_R        - Bx*Bz_R;
+  const REAL Fetot_R = etot_R*velx_R + pT_R*velx_R - Bx*vB_R;
+
+  const REAL momx_L_s  = dens_L_s *velx_L_s;
+  const REAL momy_L_s  = dens_L_s *vely_L_s;
+  const REAL momz_L_s  = dens_L_s *velz_L_s;
+  
+  const REAL momx_L_ss = dens_L_ss*velx_L_ss;
+  const REAL momy_L_ss = dens_L_ss*vely_L_ss;
+  const REAL momz_L_ss = dens_L_ss*velz_L_ss;
+
+  const REAL momx_R_s  = dens_R_s *velx_R_s;
+  const REAL momy_R_s  = dens_R_s *vely_R_s;
+  const REAL momz_R_s  = dens_R_s *velz_R_s;
+  
+  const REAL momx_R_ss = dens_R_ss*velx_R_ss;
+  const REAL momy_R_ss = dens_R_ss*vely_R_ss;
+  const REAL momz_R_ss = dens_R_ss*velz_R_ss;
+
+  const REAL Fby_L  = By_L*velx_L - Bx * vely_L;
+  const REAL Fbz_L  = Bz_L*velx_L - Bx * velz_L;
+  
+  const REAL Fby_R  = By_R*velx_R - Bx * vely_R;
+  const REAL Fbz_R  = Bz_R*velx_R - Bx * velz_R;
+
+  struct ptcl_mhd_cl flux;
+
+  if (S_L > w) {
+    flux.dens = Fdens_L - w * dens_L;
+    flux.momx = Fmomx_L - w * momx_L;
+    flux.momy = Fmomy_L - w * momy_L;
+    flux.momz = Fmomz_L - w * momz_L;
+    flux.etot = Fetot_L - w * etot_L;
+    flux.by = Fby_L - w * By_L;
+    flux.bz = Fbz_L - w * Bz_L;
+  } else if (S_L <= w && w <= S_L_s) {
+    flux.dens = Fdens_L + (S_L - w)*dens_L_s - S_L*dens_L;
+    flux.momx = Fmomx_L + (S_L - w)*momx_L_s - S_L*momx_L;
+    flux.momy = Fmomy_L + (S_L - w)*momy_L_s - S_L*momy_L;
+    flux.momz = Fmomz_L + (S_L - w)*momz_L_s - S_L*momz_L;
+    flux.etot = Fetot_L + (S_L - w)*etot_L_s - S_L*etot_L;
+    flux.by = Fby_L + (S_L - w)*By_L_s - S_L*By_L;
+    flux.bz = Fbz_L + (S_L - w)*Bz_L_s - S_L*Bz_L;
+  } else if (S_L_s <= w && w <= S_M) {
+    flux.dens = Fdens_L + (S_L_s - w)*dens_L_ss - (S_L_s - S_L)*dens_L_s - S_L*dens_L;
+    flux.momx = Fmomx_L + (S_L_s - w)*momx_L_ss - (S_L_s - S_L)*momx_L_s - S_L*momx_L;
+    flux.momy = Fmomy_L + (S_L_s - w)*momy_L_ss - (S_L_s - S_L)*momy_L_s - S_L*momy_L;
+    flux.momz = Fmomz_L + (S_L_s - w)*momz_L_ss - (S_L_s - S_L)*momz_L_s - S_L*momz_L;
+    flux.etot = Fetot_L + (S_L_s - w)*etot_L_ss - (S_L_s - S_L)*etot_L_s - S_L*etot_L;
+    flux.by = Fby_L + (S_L_s - w)*By_L_ss - (S_L_s - S_L)*By_L_s - S_L*By_L;
+    flux.bz = Fbz_L + (S_L_s - w)*Bz_L_ss - (S_L_s - S_L)*Bz_L_s - S_L*Bz_L;
+  } else if (S_M <= w && w <= S_R_s) {
+    flux.dens = Fdens_R + (S_R_s - w)*dens_R_ss - (S_R_s - S_R)*dens_R_s - S_R*dens_R;
+    flux.momx = Fmomx_R + (S_R_s - w)*momx_R_ss - (S_R_s - S_R)*momx_R_s - S_R*momx_R;
+    flux.momy = Fmomy_R + (S_R_s - w)*momy_R_ss - (S_R_s - S_R)*momy_R_s - S_R*momy_R;
+    flux.momz = Fmomz_R + (S_R_s - w)*momz_R_ss - (S_R_s - S_R)*momz_R_s - S_R*momz_R;
+    flux.etot = Fetot_R + (S_R_s - w)*etot_R_ss - (S_R_s - S_R)*etot_R_s - S_R*etot_R;
+    flux.by = Fby_R + (S_R_s - w)*By_R_ss - (S_R_s - S_R)*By_R_s - S_R*By_R;
+    flux.bz = Fbz_R + (S_R_s - w)*Bz_R_ss - (S_R_s - S_R)*Bz_R_s - S_R*Bz_R;
+  } else if (S_R_s <= w && w <= S_R) {
+    flux.dens = Fdens_R + (S_R - w)*dens_R_s - S_R*dens_R;
+    flux.momx = Fmomx_R + (S_R - w)*momx_R_s - S_R*momx_R;
+    flux.momy = Fmomy_R + (S_R - w)*momy_R_s - S_R*momy_R;
+    flux.momz = Fmomz_R + (S_R - w)*momz_R_s - S_R*momz_R;
+    flux.etot = Fetot_R + (S_R - w)*etot_R_s - S_R*etot_R;
+    flux.by = Fby_R + (S_R - w)*By_R_s - S_R*By_R;
+    flux.bz = Fbz_R + (S_R - w)*Bz_R_s - S_R*Bz_R;
+  } else {
+    flux.dens = Fdens_R - w * dens_R;
+    flux.momx = Fmomx_R - w * momx_R;
+    flux.momy = Fmomy_R - w * momy_R;
+    flux.momz = Fmomz_R - w * momz_R;
+    flux.etot = Fetot_R - w * etot_R;
+    flux.by = Fby_R - w * By_R;
+    flux.bz = Fbz_R - w * Bz_R;
+  }
+#else
+  struct ptcl_mhd_cl flux = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f ,0.0f,0.0f};
+#endif
+  return flux;
+}
+
+__kernel void compute_fluxes(__global float4      *out_fluxes1,       //  0
+			     __global float4      *out_fluxes2,       //  1
+			     __global float4      *out_Fscalar,       //  2
+			     __global float4      *out_divB,          //  3
+			     __global int2        *ijlist,            //  4
+			     __global float4      *in_drij,           //  5
+			     __global float4      *in_dwij,           //  6
+			     __global float4      *mhd1,              //  7
+			     __global float4      *mhd2,              //  8
+			     __global float4      *mhd3,              //  9
+			     __global float4      *mhd1_grad_x,       // 10
+			     __global float4      *mhd1_grad_y,       // 11
+			     __global float4      *mhd1_grad_z,       // 12
+			     __global float4      *mhd2_grad_x,       // 13
+			     __global float4      *mhd2_grad_y,       // 14
+			     __global float4      *mhd2_grad_z,       // 15
+			     __global float4      *mhd3_grad_x,       // 16
+			     __global float4      *mhd3_grad_y,       // 17
+			     __global float4      *mhd3_grad_z,       // 18
+			     const int            n_states,           // 19
+			     const float          gamma_gas,          // 20
+			     const float          ch_global,          // 21
+			     const int            reconstruct) {   // 22
+
+  // Compute idx of the element
+  const int gidx = get_global_id(0) + get_global_id(1) * get_global_size(0);
+  const int idx = min(gidx, n_states - 1);
+
+  //////////////
+
+  // Get i- & j- bodies idx
+  const int2 ij = ijlist[idx];
+  const int  i = ij.x;
+  const int  j = ij.y;
+
+  float4 imhd1 = mhd1[i];
+  float4 imhd2 = mhd2[i];
+  float4 imhd3 = mhd3[i];
+
+  float4 jmhd1 = mhd1[j];
+  float4 jmhd2 = mhd2[j];
+  float4 jmhd3 = mhd3[j];
+
+  //////////////
+
+#if 1
+  if (reconstruct == 1) {
+    const float4 dr = in_drij[idx];
+    const float4 ds = {0.5f*dr.x, 0.5f*dr.y, 0.5f*dr.z, 0.0f};
+
+    ///////// ij-state mhd1
+
+    const float4 imhd1o = imhd1;
+    const float4 jmhd1o = jmhd1;
+
+    imhd1 += ds.x * mhd1_grad_x[i];
+    imhd1 += ds.y * mhd1_grad_y[i];
+    imhd1 += ds.z * mhd1_grad_z[i];
+
+    jmhd1 -= ds.x * mhd1_grad_x[j];
+    jmhd1 -= ds.y * mhd1_grad_y[j];
+    jmhd1 -= ds.z * mhd1_grad_z[j];
+
+    float2 v;
+    v = monotonicity(imhd1.x, jmhd1.x, imhd1o.x, jmhd1o.x); imhd1.x = v.x; jmhd1.x = v.y;
+    v = monotonicity(imhd1.y, jmhd1.y, imhd1o.y, jmhd1o.y); imhd1.y = v.x; jmhd1.y = v.y;
+    v = monotonicity(imhd1.z, jmhd1.z, imhd1o.z, jmhd1o.z); imhd1.z = v.x; jmhd1.z = v.y;
+    v = monotonicity(imhd1.w, jmhd1.w, imhd1o.w, jmhd1o.w); imhd1.w = v.x; jmhd1.w = v.y;
+    
+    const float4 imhd2o = imhd2;
+    const float4 jmhd2o = jmhd2; 
+    imhd2 += ds.x * mhd2_grad_x[i];
+    imhd2 += ds.y * mhd2_grad_y[i];
+    imhd2 += ds.z * mhd2_grad_z[i];
+
+    jmhd2 -= ds.x * mhd2_grad_x[j];
+    jmhd2 -= ds.y * mhd2_grad_y[j];
+    jmhd2 -= ds.z * mhd2_grad_z[j];
+
+    v = monotonicity(imhd2.x, jmhd2.x, imhd2o.x, jmhd2o.x); imhd2.x = v.x; jmhd2.x = v.y;
+    v = monotonicity(imhd2.y, jmhd2.y, imhd2o.y, jmhd2o.y); imhd2.y = v.x; jmhd2.y = v.y;
+    v = monotonicity(imhd2.z, jmhd2.z, imhd2o.z, jmhd2o.z); imhd2.z = v.x; jmhd2.z = v.y;
+    v = monotonicity(imhd2.w, jmhd2.w, imhd2o.w, jmhd2o.w); imhd2.w = v.x; jmhd2.w = v.y;
+
+    const float4 imhd3o = imhd3;
+    const float4 jmhd3o = jmhd3;
+    imhd3 += ds.x * mhd3_grad_x[i];
+    imhd3 += ds.y * mhd3_grad_y[i];
+    imhd3 += ds.z * mhd3_grad_z[i];
+
+    jmhd3 -= ds.x * mhd3_grad_x[j];
+    jmhd3 -= ds.y * mhd3_grad_y[j];
+    jmhd3 -= ds.z * mhd3_grad_z[j];
+
+
+    v = monotonicity(imhd3.x, jmhd3.x, imhd3o.x, jmhd3o.x); imhd3.x = v.x; jmhd3.x = v.y;
+    v = monotonicity(imhd3.y, jmhd3.y, imhd3o.y, jmhd3o.y); imhd3.y = v.x; jmhd3.y = v.y;
+    v = monotonicity(imhd3.z, jmhd3.z, imhd3o.z, jmhd3o.z); imhd3.z = v.x; jmhd3.z = v.y;
+    v = monotonicity(imhd3.w, jmhd3.w, imhd3o.w, jmhd3o.w); imhd3.w = v.x; jmhd3.w = v.y;
+
+  }
+#endif  
+
+  //////////////
+
+  const float4 dwij = in_dwij[idx];
+  const float  dw2 = dwij.x*dwij.x + dwij.y*dwij.y + dwij.z*dwij.z;
+  const float iwij = (dw2 > 0.0f) ? rsqrt(dw2) : 0.0f;
+  const float  wij = (dw2 > 0.0f) ? 1.0f/iwij  : 0.0f;
+  
+  const float4 e = {dwij.x*iwij, dwij.y*iwij, dwij.z*iwij, 0.0f};
+  
+  const float Wx = dwij.w;
+
+  const float dR2   = e.x*e.x + e.y*e.y;
+  const float idR   = (dR2 > 0.0f) ? rsqrt(dR2) : 0.0f;
+  const float cosph = (idR == 0.0f) ? 1.0f  : e.x*idR;
+  const float sinph = (idR == 0.0f) ? 0.0f  : e.y*idR;
+  const float costh = e.z;
+  const float sinth = (dR2 > 0.0f) ? 1.0f/idR : 0.0f;
+
+  const float Axx =  cosph*sinth;
+  const float Axy =  sinth*sinph;
+  const float Axz =  costh;
+  const float Ayx = -sinph;
+  const float Ayy =  cosph;
+  const float Ayz =  0.0f;
+  const float Azx = -costh*cosph;
+  const float Azy = -costh*sinph;
+  const float Azz =  sinth;
+ 
+  const float4 sL1 = imhd1;
+  const float4 sL2 = imhd2;
+  const float qL_dens = sL1.w;
+  const float qL_pres = compute_pressure(qL_dens, sL2.w, gamma_gas);
+  const float qL_velx = sL1.x;
+  const float qL_vely = sL1.y;
+  const float qL_velz = sL1.z;
+  const float qL_Bx   = sL2.x;
+  const float qL_By   = sL2.y;
+  const float qL_Bz   = sL2.z;
+
+  const float4 sR1 = jmhd1;
+  const float4 sR2 = jmhd2;
+  const float qR_dens = sR1.w;
+  const float qR_pres = compute_pressure(qR_dens, sR2.w, gamma_gas);
+  const float qR_velx = sR1.x;
+  const float qR_vely = sR1.y;
+  const float qR_velz = sR1.z;
+  const float qR_Bx   = sR2.x;
+  const float qR_By   = sR2.y;
+  const float qR_Bz   = sR2.z;
+  
+  const float dens_L = qL_dens;
+  const float pres_L = qL_pres;
+  const float velx_L = Axx*qL_velx + Axy*qL_vely + Axz*qL_velz;
+  const float vely_L = Ayx*qL_velx + Ayy*qL_vely + Ayz*qL_velz;
+  const float velz_L = Azx*qL_velx + Azy*qL_vely + Azz*qL_velz;
+  const float Bx_L   = Axx*qL_Bx   + Axy*qL_By   + Axz*qL_Bz;
+  const float By_L   = Ayx*qL_Bx   + Ayy*qL_By   + Ayz*qL_Bz;
+  const float Bz_L   = Azx*qL_Bx   + Azy*qL_By   + Azz*qL_Bz;
+  
+  const float dens_R = qR_dens;
+  const float pres_R = qR_pres;
+  const float velx_R = Axx*qR_velx + Axy*qR_vely + Axz*qR_velz;
+  const float vely_R = Ayx*qR_velx + Ayy*qR_vely + Ayz*qR_velz;
+  const float velz_R = Azx*qR_velx + Azy*qR_vely + Azz*qR_velz; 
+  const float Bx_R   = Axx*qR_Bx   + Axy*qR_By   + Axz*qR_Bz;
+  const float By_R   = Ayx*qR_Bx   + Ayy*qR_By   + Ayz*qR_Bz;
+  const float Bz_R   = Azx*qR_Bx   + Azy*qR_By   + Azz*qR_Bz;
+
+  
+  const float4 scalarsL = imhd3;
+  const float4 scalarsR = jmhd3;
+  const float psiL = scalarsL.x;
+  const float psiR = scalarsR.x;
+  
+  const float B_M  = (Bx_L + Bx_R)*0.5f - 0.5f/ch_global*(psiR - psiL);
+  const float psiM = (psiL + psiR)*0.5f - 0.5f*ch_global*(Bx_R - Bx_L);
+
+  const struct ptcl_mhd_cl flux = riemann_solver(Wx, B_M, gamma_gas,
+						 dens_L, pres_L, velx_L, vely_L, velz_L, By_L, Bz_L,
+						 dens_R, pres_R, velx_R, vely_R, velz_R, By_R, Bz_R);
+  
+  const float flux_bx  = -Wx*B_M + psiM;
+  
+  const float iAxx =  cosph*sinth;
+  const float iAxy = -sinph;
+  const float iAxz = -costh*cosph;
+  const float iAyx =  sinth*sinph;
+  const float iAyy =  cosph;
+  const float iAyz = -costh*sinph;
+  const float iAzx =  costh;
+  const float iAzy =  0.0f;
+  const float iAzz =  sinth; 
+
+  const float flux_mass  = flux.dens;
+  const float flux_etot  = flux.etot;
+  const float flux_momx  = iAxx*flux.momx + iAxy*flux.momy + iAxz*flux.momz;
+  const float flux_momy  = iAyx*flux.momx + iAyy*flux.momy + iAyz*flux.momz;
+  const float flux_momz  = iAzx*flux.momx + iAzy*flux.momy + iAzz*flux.momz;
+  const float flux_wBx   = iAxx*flux_bx   + iAxy*flux.by   + iAxz*flux.bz;
+  const float flux_wBy   = iAyx*flux_bx   + iAyy*flux.by   + iAyz*flux.bz;
+  const float flux_wBz   = iAzx*flux_bx   + iAzy*flux.by   + iAzz*flux.bz;
+
+  if (gidx < n_states) {
+    out_fluxes1[idx] = (float4){flux_momx * wij, flux_momy *  wij, flux_momz *  wij, flux_mass * wij};
+    out_fluxes2[idx] = (float4){flux_wBx  * wij, flux_wBy  *  wij, flux_wBz  *  wij, flux_etot * wij};
+#if 1
+    out_divB   [idx] = (float4){psiM * dwij.x, psiM * dwij.y, psiM * dwij.z, B_M * wij};
+#else
+    out_divB[idx] = (wij > 0.0f) ? (float4){0,0,0,1} : (float4){0,0,0,0}; 
+#endif
+  }
+
+  ///////////////////
+  
+  const float4 scal = (flux_mass > 0.0f) ? scalarsL : scalarsR;
+  const float  Fpsi = ch_global*ch_global * B_M;
+  if (gidx < n_states) {
+    out_Fscalar[idx] = (float4){Fpsi * wij, flux_mass * scal.y, flux_mass * scal.z, flux_mass * scal.w};
+  }
+  
+}
+
+
+#endif  

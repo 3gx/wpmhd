@@ -1,0 +1,160 @@
+#ifndef _KERNELS_CLH_
+#define _KERNELS_CLH_
+
+#define HUGE 1.0e10f
+#define TINY 1.0e-10f
+
+#define SMALLF 1.0e-16f
+
+#if NDIM == 2
+#define KERNEL_COEFF_1  (5.0f/7.0f*2.546479089470f )
+#define KERNEL_COEFF_2  (5.0f/7.0f*15.278874536822f)
+#define KERNEL_COEFF_3  (5.0f/7.0f*45.836623610466f)
+#define KERNEL_COEFF_4  (5.0f/7.0f*30.557749073644f)
+#define KERNEL_COEFF_5  (5.0f/7.0f*5.092958178941f)
+#define KERNEL_COEFF_6  (5.0f/7.0f*(-15.278874536822f))
+#define NORM_COEFF      3.14159265358979f
+#elif NDIM == 3
+#define KERNEL_COEFF_1   2.546479089470f
+#define KERNEL_COEFF_2  15.278874536822f
+#define KERNEL_COEFF_3  45.836623610466f
+#define KERNEL_COEFF_4  30.557749073644f
+#define KERNEL_COEFF_5   5.092958178941f
+#define KERNEL_COEFF_6 (-15.278874536822f)
+#define NORM_COEFF     (4.0f/3.0f*3.14159265358979)
+#endif
+
+__inline float kernel_w(const float u) {
+  const float w1 = KERNEL_COEFF_1 + KERNEL_COEFF_2 * (u - 1.0f) * u * u;
+  const float w2 = KERNEL_COEFF_5 * (1.0f - u) * (1.0f - u) * (1.0f- u);
+  const float w  = (u < 0.5f) ? w1 : ((u < 1.0f) ?  w2 : 0.0f);
+  return w;
+}
+
+// __inline float kernel_dw(const float u) {
+//   const float w1 = 0.0f*KERNEL_COEFF_1 + KERNEL_COEFF_2 * (3.0f * u*u - 2.0f * u);
+//   const float w2 = -3.0f*KERNEL_COEFF_5 * (1.0f - u) * (1.0f - u);
+//   const float w  = (u < 0.5f) ? w1 : ((u < 1.0f) ?  w2 : 0.0f);
+//   return w;
+// }
+
+///////
+
+#if 1
+
+__inline float kernel_w4(const float u) {
+  const float w1 = KERNEL_COEFF_1 + KERNEL_COEFF_2 * (u - 1.0f) * u * u;
+  const float w2 = KERNEL_COEFF_5 * (1.0f - u) * (1.0f - u) * (1.0f- u);
+  const float w  = (u < 0.5f) ? w1 : ((u < 1.0f) ?  w2 : 0.0f);
+  return w;
+}
+
+__inline float kernel_dw4(const float u) {
+  const float w1 = 0.0f*KERNEL_COEFF_1 + KERNEL_COEFF_2 * (3.0f * u*u - 2.0f * u);
+  const float w2 = -3.0f*KERNEL_COEFF_5 * (1.0f - u) * (1.0f - u);
+  const float w  = (u < 0.5f) ? w1 : ((u < 1.0f) ?  w2 : 0.0f);
+  return w;
+}
+
+#elif 1 //////// sqrt
+
+__inline float kernel_w4(const float u) {
+  const float w0 = kernel_w(u);
+  const float w  = sqrt(w0);
+
+#if NDIM == 2
+  return w/1.4f;
+#elif NDIM == 3
+  return w/1.4f;
+#endif
+
+}
+
+__inline float kernel_dw4(const float u) {
+  const float w1 = 0.0f*KERNEL_COEFF_1 + KERNEL_COEFF_2 * (3.0f * u*u - 2.0f * u);
+  const float w2 = -3.0f*KERNEL_COEFF_5 * (1.0f - u) * (1.0f - u);
+
+  const float w0  = kernel_w(u);
+  const float sw1 = sqrt(w0);
+  const float sw  = 2.0f*sw1; //*sw1*sw1;
+  
+#if NDIM == 2
+  const float w  = sw*1.4f;
+#elif NDIM == 3
+  const float w  = sw*1.4f;
+#endif
+
+  const float dw = (u < 0.5f) ? w1/w : ((u < 1.0f) ?  w2/w : 0.0f);
+
+  return dw;
+}
+
+#elif 0 // sqrt sqrt///////////////////////////////////////////////////////
+
+__inline float kernel_w4(const float u) {
+  const float w0 = kernel_w(u);
+  const float w  = sqrt(sqrt(w0));
+  
+#if NDIM == 2
+  return w/1.9f;
+#elif NDIM == 3
+  return w/1.9f;
+#endif
+
+}
+
+__inline float kernel_dw4(const float u) {
+  const float w1 = 0.0f*KERNEL_COEFF_1 + KERNEL_COEFF_2 * (3.0f * u*u - 2.0f * u);
+  const float w2 = -3.0f*KERNEL_COEFF_5 * (1.0f - u) * (1.0f - u);
+
+  const float w0  = kernel_w(u);
+  const float sw1 = sqrt(sqrt(w0));
+  const float sw  = 4.0f*sw1*sw1*sw1;
+  
+#if NDIM == 2
+  const float w  = sw*1.9f;
+#elif NDIM == 3
+  const float w  = sw*1.9f;
+#endif
+
+  const float dw = (u < 0.5f) ? w1/w : ((u < 1.0f) ?  w2/w : 0.0f);
+
+  return dw;
+}
+
+
+#elif 0 // sqrt sqrt sqrt///////////////////////////////////////////////////////
+
+__inline float kernel_w4(const float u) {
+  const float w0 = kernel_w(u);
+  const float w  = sqrt(sqrt(sqrt(sqrt(w0))));
+  
+#if NDIM == 2
+  return w/2.3f;
+#elif NDIM == 3
+  return w/2.3f;
+#endif
+
+}
+
+__inline float kernel_dw4(const float u) {
+  const float w1 = 0.0f*KERNEL_COEFF_1 + KERNEL_COEFF_2 * (3.0f * u*u - 2.0f * u);
+  const float w2 = -3.0f*KERNEL_COEFF_5 * (1.0f - u) * (1.0f - u);
+
+  const float w0  = kernel_w(u);
+  const float sw1 = sqrt(sqrt(sqrt(sqrt(w0))));
+  const float sw  = 8.0f*sw1*sw1*sw1*sw1*sw1*sw1*sw1;
+  
+#if NDIM == 2
+  const float w  = sw*2.3f;
+#elif NDIM == 3
+  const float w  = sw*2.3f;
+#endif
+
+  const float dw = (u < 0.5f) ? w1/w : ((u < 1.0f) ?  w2/w : 0.0f);
+
+  return dw;
+}
+
+#endif
+#endif

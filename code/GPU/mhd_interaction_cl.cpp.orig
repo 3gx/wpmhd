@@ -1,0 +1,341 @@
+
+#include "gn.h"
+
+void system::mhd_interaction_cl() {
+  const double t0 = get_time();
+
+  const int n_leaves = local_tree.leaf_list.size();
+  
+  /// compute ijlist_offset
+
+  std::vector<int> ijlist_offset(n_leaves + 1);
+  gpu.ijlist_offset.cmalloc(n_leaves + 1);
+  gpu.leaf_ngb_max.cmalloc(n_leaves);
+  int leaf_beg = 0;
+  int max_size  = 0;
+  ijlist_offset[0] = 0;
+  while (leaf_beg < n_leaves) {
+    const int leaf_end = std::min(leaf_beg + NGPUBLOCKS, n_leaves);
+    gpu.ijlist_offset[leaf_beg] = 0;
+    int max_ngb = 0;
+    for (int leaf = leaf_beg; leaf < leaf_end; leaf++) {
+      const octnode<TREE_NLEAF> &inode = *local_tree.leaf_list[leaf];
+      for (octbody *ibp = inode.pfirst; ibp != NULL; ibp = ibp->next) {
+	max_ngb = std::max(max_ngb, gpu.ngb_both[ibp->pp->local_idx]);
+      }
+      gpu.ijlist_offset[leaf + 1] = gpu.ijlist_offset[leaf] + max_ngb * inode.nparticle;
+      ijlist_offset    [leaf + 1] =     ijlist_offset[leaf] + max_ngb * inode.nparticle;
+
+      max_size = std::max(max_size, gpu.ijlist_offset[leaf + 1]);
+      gpu.leaf_ngb_max[leaf] = max_ngb;
+    }    
+    leaf_beg += NGPUBLOCKS;
+  }
+  gpu.ijlist_offset.h2d();
+  gpu.leaf_ngb_max.h2d();
+  
+
+  gpu.ijlist.cmalloc(max_size);
+  gpu.drij.cmalloc(max_size);
+  gpu.dwij.cmalloc(max_size);
+  gpu.mhd1_statesL.cmalloc(max_size);
+  gpu.mhd1_statesR.cmalloc(max_size);
+  gpu.mhd2_statesL.cmalloc(max_size);
+  gpu.mhd2_statesR.cmalloc(max_size);
+  gpu.mhd3_statesL.cmalloc(max_size);
+  gpu.mhd3_statesR.cmalloc(max_size);
+  gpu.fluxes1.cmalloc(max_size);
+  gpu.fluxes2.cmalloc(max_size);
+  gpu.fluxes3.cmalloc(max_size);
+  gpu.divBij.cmalloc(max_size);
+  gpu.dndt_ij.cmalloc(max_size);
+  
+  gpu.dqdt1.cmalloc(local_n);
+  gpu.dqdt2.cmalloc(local_n);
+  gpu.dqdt3.cmalloc(local_n);
+  gpu.divB.cmalloc(local_n);
+  gpu.dndt.cmalloc(local_n); 
+ 
+  fprintf(stderr, "max_size= %d\n", max_size);
+
+  pmhd_dot.resize(local_n);
+  dwdt_i.resize(local_n);
+  divB_i.resize(local_n);
+  
+  
+  std::vector<int> cpu_jlist, cpu_joffset(NGPUBLOCKS + 1), cpu_leaf_list(NGPUBLOCKS);
+  cpu_jlist.reserve(1024);
+
+  leaf_beg = 0;
+  while (leaf_beg < n_leaves) {
+    cpu_jlist.clear();
+    int block = 0, nj = 0;
+    cpu_joffset[0] = nj;
+    const int leaf_end = std::min(leaf_beg + NGPUBLOCKS, n_leaves);
+    for (int leaf = leaf_beg; leaf < leaf_end; leaf++) {
+      const std::vector<octnode<TREE_NLEAF>*> &ileaf_list = ngb_leaf_list_outer[leaf];
+      const int n_ngb_leaves = ileaf_list.size();
+      for (int ngb_leaf = 0; ngb_leaf < n_ngb_leaves; ngb_leaf++) {
+	const octnode<TREE_NLEAF> &jnode = *ileaf_list[ngb_leaf];
+	for (octbody *jbp = jnode.pfirst; jbp != NULL; jbp = jbp->next)  {
+	  cpu_jlist.push_back(jbp->pp->local_idx);
+	  nj++;
+	}
+      }
+      cpu_leaf_list[block] = leaf;
+      cpu_joffset[++block] = nj;
+      assert(nj == (int)cpu_jlist.size());
+    }
+    
+    clFinish(gpu.context.get_command_queue());
+    gpu.jlist.cmalloc(cpu_joffset[block]);
+    gpu.joffset[0] = 0;
+    for (int i = 0; i < block; i++) {
+      gpu.leaf_list[i] = cpu_leaf_list[i];
+      gpu.joffset[i+1] = cpu_joffset[i+1];
+    }
+    for (int i = 0; i < gpu.joffset[block]; i++) {
+      gpu.jlist[i] = cpu_jlist[i];
+    }
+    gpu.jlist.h2d(CL_FALSE);
+    gpu.joffset.h2d(CL_FALSE);
+    gpu.leaf_list.h2d(CL_FALSE);
+    
+    ///
+    const int nthreads = NMAXTHREADS;
+    const int nthreads_work = 64;
+    gpu.extract_ijlist.setWork(-1, nthreads, block);
+    gpu.extract_ijlist.set_arg<void* >( 0, gpu.ijlist.p());
+    gpu.extract_ijlist.set_arg<void* >( 1, gpu.drij.p());
+    gpu.extract_ijlist.set_arg<void* >( 2, gpu.leaf_list.p());
+    gpu.extract_ijlist.set_arg<void* >( 3, gpu.body_list.p());
+    gpu.extract_ijlist.set_arg<void* >( 4, gpu.ilist.p());
+    gpu.extract_ijlist.set_arg<void* >( 5, gpu.ppos.p());
+    gpu.extract_ijlist.set_arg<void* >( 6, gpu.jlist.p());
+    gpu.extract_ijlist.set_arg<void* >( 7, gpu.joffset.p());
+    gpu.extract_ijlist.set_arg<void* >( 8, gpu.ijlist_offset.p());
+    gpu.extract_ijlist.set_arg<void* >( 9, gpu.leaf_ngb_max.p());
+    gpu.extract_ijlist.set_arg<float4>(10, &gpu.domain_hsize);
+    gpu.extract_ijlist.set_arg<float >(11, NULL, 5*nthreads);
+    gpu.extract_ijlist.execute();
+//     clFinish(gpu.context.get_command_queue());
+    
+//     int n_states = gpu.ijlist_offset[leaf_beg + block - 1] + gpu.leaf_ngb_max[leaf_beg + block - 1];
+    int n_states = ijlist_offset[leaf_end] - ijlist_offset[leaf_beg];
+//     fprintf(stderr, "n_states= %d\n", n_states);
+    // compute Wij
+    gpu.compute_dwij.setWork(n_states, nthreads_work);
+    gpu.compute_dwij.set_arg<void* >( 0, gpu.dwij.p());
+    gpu.compute_dwij.set_arg<void* >( 1, gpu.ijlist.p());
+    gpu.compute_dwij.set_arg<void* >( 2, gpu.drij.p());
+    gpu.compute_dwij.set_arg<void* >( 3, gpu.ppos.p());
+    gpu.compute_dwij.set_arg<void* >( 4, gpu.pvel.p());
+    gpu.compute_dwij.set_arg<void* >( 5, gpu.Bxx.p());
+    gpu.compute_dwij.set_arg<void* >( 6, gpu.Bxy.p());
+    gpu.compute_dwij.set_arg<void* >( 7, gpu.Bxz.p());
+    gpu.compute_dwij.set_arg<void* >( 8, gpu.Byy.p());
+    gpu.compute_dwij.set_arg<void* >( 9, gpu.Byz.p());
+    gpu.compute_dwij.set_arg<void* >(10, gpu.Bzz.p());
+    gpu.compute_dwij.set_arg<int   >(11, &n_states);
+    gpu.compute_dwij.set_arg<float4>(12, &gpu.domain_hsize);
+    gpu.compute_dwij.execute();
+//     clFinish(gpu.context.get_command_queue());
+
+    // Reconstruct states
+    gpu.compute_states.setWork(n_states, nthreads_work);
+    gpu.compute_states.set_arg<void* >( 2, gpu.ijlist.p());
+    gpu.compute_states.set_arg<void* >( 3, gpu.drij.p());
+    gpu.compute_states.set_arg<int   >( 8, &n_states);
+    int ifirst_order = 0;
+    if (do_first_order) ifirst_order = 1;
+    gpu.compute_states.set_arg<int>( 9, &ifirst_order);
+    
+
+    gpu.compute_states.set_arg<void* >( 0, gpu.mhd1_statesL.p());
+    gpu.compute_states.set_arg<void* >( 1, gpu.mhd1_statesR.p());
+    gpu.compute_states.set_arg<void* >( 4, gpu.mhd1.p());
+    gpu.compute_states.set_arg<void* >( 5, gpu.mhd1_grad_x.p());
+    gpu.compute_states.set_arg<void* >( 6, gpu.mhd1_grad_y.p());
+    gpu.compute_states.set_arg<void* >( 7, gpu.mhd1_grad_z.p());
+    gpu.compute_states.execute();
+//     clFinish(gpu.context.get_command_queue());
+
+    gpu.compute_states.set_arg<void* >( 0, gpu.mhd2_statesL.p());
+    gpu.compute_states.set_arg<void* >( 1, gpu.mhd2_statesR.p());
+    gpu.compute_states.set_arg<void* >( 4, gpu.mhd2.p());
+    gpu.compute_states.set_arg<void* >( 5, gpu.mhd2_grad_x.p());
+    gpu.compute_states.set_arg<void* >( 6, gpu.mhd2_grad_y.p());
+    gpu.compute_states.set_arg<void* >( 7, gpu.mhd2_grad_z.p());
+    gpu.compute_states.execute();
+//     clFinish(gpu.context.get_command_queue());
+
+    gpu.compute_states.set_arg<void* >( 0, gpu.mhd3_statesL.p());
+    gpu.compute_states.set_arg<void* >( 1, gpu.mhd3_statesR.p());
+    gpu.compute_states.set_arg<void* >( 4, gpu.mhd3.p());
+    gpu.compute_states.set_arg<void* >( 5, gpu.mhd3_grad_x.p());
+    gpu.compute_states.set_arg<void* >( 6, gpu.mhd3_grad_y.p());
+    gpu.compute_states.set_arg<void* >( 7, gpu.mhd3_grad_z.p());
+    gpu.compute_states.execute();
+//     clFinish(gpu.context.get_command_queue());
+
+    // Compute fluxes
+    gpu.compute_fluxes.setWork(n_states, nthreads_work);
+    gpu.compute_fluxes.set_arg<void* >( 0, gpu.fluxes1.p());
+    gpu.compute_fluxes.set_arg<void* >( 1, gpu.fluxes2.p());
+    gpu.compute_fluxes.set_arg<void* >( 2, gpu.fluxes3.p());
+    gpu.compute_fluxes.set_arg<void* >( 3, gpu.divBij.p());
+    gpu.compute_fluxes.set_arg<void* >( 4, gpu.dwij.p());
+    gpu.compute_fluxes.set_arg<void* >( 5, gpu.mhd1_statesL.p());
+    gpu.compute_fluxes.set_arg<void* >( 6, gpu.mhd1_statesR.p());
+    gpu.compute_fluxes.set_arg<void* >( 7, gpu.mhd2_statesL.p());
+    gpu.compute_fluxes.set_arg<void* >( 8, gpu.mhd2_statesR.p());
+    gpu.compute_fluxes.set_arg<void* >( 9, gpu.mhd3_statesL.p());
+    gpu.compute_fluxes.set_arg<void* >(10, gpu.mhd3_statesR.p());
+    gpu.compute_fluxes.set_arg<int   >(11, &n_states);
+    gpu.compute_fluxes.set_arg<float >(12, &gamma_gas);
+    gpu.compute_fluxes.set_arg<float >(13, &ch_glob);
+    gpu.compute_fluxes.execute();
+//     clFinish(gpu.context.get_command_queue());
+
+    // Reduce fluxes
+    gpu.reduce_fluxes.setWork(-1, nthreads, block);
+    gpu.reduce_fluxes.set_arg<void* >( 0, gpu.dqdt1.p());
+    gpu.reduce_fluxes.set_arg<void* >( 1, gpu.dqdt2.p());
+    gpu.reduce_fluxes.set_arg<void* >( 2, gpu.dqdt3.p());
+    gpu.reduce_fluxes.set_arg<void* >( 3, gpu.divB.p());
+    gpu.reduce_fluxes.set_arg<void* >( 4, gpu.leaf_list.p());
+    gpu.reduce_fluxes.set_arg<void* >( 5, gpu.body_list.p());
+    gpu.reduce_fluxes.set_arg<void* >( 6, gpu.ilist.p());
+    gpu.reduce_fluxes.set_arg<void* >( 7, gpu.ijlist_offset.p());
+    gpu.reduce_fluxes.set_arg<void* >( 8, gpu.leaf_ngb_max.p());
+    gpu.reduce_fluxes.set_arg<void* >( 9, gpu.fluxes1.p());
+    gpu.reduce_fluxes.set_arg<void* >(10, gpu.fluxes2.p());
+    gpu.reduce_fluxes.set_arg<void* >(11, gpu.fluxes3.p());
+    gpu.reduce_fluxes.set_arg<void* >(12, gpu.divBij.p());
+    gpu.reduce_fluxes.execute();
+//     clFinish(gpu.context.get_command_queue());
+
+    leaf_beg += NGPUBLOCKS;
+  }
+  clFinish(gpu.context.get_command_queue());
+  
+  gpu.dqdt1.d2h();
+  gpu.dqdt2.d2h();
+  gpu.dqdt3.d2h();
+  gpu.divB.d2h();
+
+  for (int i = 0; i < local_n; i++) {
+    const particle &pi = pvec[i];
+    const ptcl_mhd &mi = pmhd[i];
+    
+    const float hi = pi.h;
+    const float inv_hi = 1.0/hi;
+    const float wi = pi.wght;
+    const float inv_hidim = kernel.pow(inv_hi);
+    
+    ptcl_mhd dQdt;
+    dQdt.mass  = -gpu.dqdt1[i].w;
+    dQdt.mom.x = -gpu.dqdt1[i].x;
+    dQdt.mom.y = -gpu.dqdt1[i].y;
+    dQdt.mom.z = -gpu.dqdt1[i].z;
+    dQdt.etot  = -gpu.dqdt2[i].w;
+    dQdt.wB.x  = -gpu.dqdt2[i].x;
+    dQdt.wB.y  = -gpu.dqdt2[i].y;
+    dQdt.wB.z  = -gpu.dqdt2[i].z;
+    dQdt.psi   = -gpu.dqdt3[i].x/pi.wght;
+    
+    // compute dwdt
+    
+    const float ni   = 1.0f/wi;
+    const float dhdn = -(hi/ni)/kernel.ndim;
+    
+
+#if 0    
+    const float dndt  = gpu.dndt[i].x;
+    float omega       = gpu.dndt[i].y;
+    omega  = 1.0f + dhdn*inv_hi*(kernel.ndim*ni + omega*inv_hidim);
+    omega /= inv_hidim;
+    const float dnidt  = dndt /omega;
+    const float dwdt  = -dnidt /sqr(ni);
+#else
+    const float dwdt = 0.0f;
+#endif
+    if (eulerian_mode) assert(dwdt == 0.0f);
+  
+    ///////
+
+    assert(i == pi.local_idx);
+
+    const float divB = gpu.divB[i].w;
+
+    dwdt_i[i] = dwdt;
+    divB_i[i] = divB/wi;
+    
+    //
+
+
+    ptcl_mhd &dot = pmhd_dot[i];
+    const ptcl_mhd dot0 = dot;
+    dot = dQdt;
+
+//      if (i < 100) {
+    const float3 gradpsi = {gpu.divB[i].x, gpu.divB[i].y, gpu.divB[i].z};
+
+#if 1
+    dQdt.etot -= mi.B.x*gradpsi.x + mi.B.y*gradpsi.y + mi.B.z*gradpsi.z;
+    
+    dQdt.wB.x -= mi.vel.x*divB;
+    dQdt.wB.y -= mi.vel.y*divB;
+    dQdt.wB.z -= mi.vel.z*divB;
+    
+    const float uB = mi.vel.x*mi.B.x + mi.vel.y*mi.B.y + mi.vel.z*mi.B.z;
+    dQdt.mom.x -= mi.B.x*divB;
+    dQdt.mom.y -= mi.B.y*divB;
+    dQdt.mom.z -= mi.B.z*divB;
+    dQdt.etot  -= uB * divB;
+#endif
+
+    // compute dQdt in primitive      
+    dot = dQdt;
+
+#if 1
+#ifdef _CONSERVATIVE_
+#elif defined _SEMICONSERVATIVE_
+    dot.ethm = dQdt.etot 
+      - (mi.vel.x*dQdt.mom.x + mi.vel.y*dQdt.mom.y + mi.vel.z*dQdt.mom.z)
+      + (sqr(mi.vel.x) + sqr(mi.vel.y) + sqr(mi.vel.z)) * dQdt.mass*0.5f;
+    
+#else
+    dot.ethm = dQdt.etot 
+      - (mi.vel.x*dQdt.mom.x + mi.vel.y*dQdt.mom.y + mi.vel.z*dQdt.mom.z)
+      + (sqr(mi.vel.x) + sqr(mi.vel.y) + sqr(mi.vel.z)) * dQdt.mass*0.5f
+      - (mi.B.x*dQdt.wB.x + mi.B.y*dQdt.wB.y + mi.B.z*dQdt.wB.z)
+      + (sqr(mi.B.x) + sqr(mi.B.y) + sqr(mi.B.z)) * dwdt*0.5f;
+    
+#endif
+#endif
+      
+    const real  m  = mi.dens   * wi;
+    const float4 acc = body_forces(pi.pos);
+    dot.mom.x += acc.x*m;
+    dot.mom.y += acc.y*m;
+    dot.mom.z += acc.z*m;
+
+#if 0
+     if (true) {
+//        dot.mom.x = gpu.divB[i].x;
+//        dot.mom.x = gpu.ngb_both[i];
+        fprintf(stdout, "i= %d   dQdt_gpu= %g  dQdt_cpu= %g err= %g\n",
+//  		i, dot.mom.x, dot0.mom.x, fabs(1 - dot0.mom.x/dot.mom.x));
+   		i, dot.etot, dot0.etot, fabs(1 - dot0.etot/dot.etot));
+//  		i, divB_i[i], divB/wi, fabs(1 - dot0.etot/dot.etot));
+     }
+#endif
+
+  }
+
+  
+  t_mhd_interaction = get_time() - t0;
+  return;
+
+}
